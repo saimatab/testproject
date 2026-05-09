@@ -1,0 +1,9 @@
+# Local settings - don't commit personal preferences
+settings.local.json
+
+# Temporary files
+*.tmp
+*.log
+
+# Agent logs/cache
+agents/**/*.log

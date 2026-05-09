@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "FileChanged": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "Review the changed file(s) in this repository. The file path(s) are provided in the input JSON below:\n\n$ARGUMENTS\n\nAnalyze the changed code against these dimensions:\n\n1. **Security**: Check for vulnerabilities, injection risks, exposed secrets, proper input validation, auth checks\n2. **Performance**: Look for bottlenecks, inefficient algorithms, memory/resource leaks, unnecessary operations\n3. **Code Quality**: Verify readability, naming conventions, DRY principle, function size, consistency\n4. **Error Handling**: Ensure proper exception handling, informative error messages, graceful degradation\n5. **Testing**: Check if tests are updated, edge cases covered, meaningful test cases\n6. **Documentation**: Verify comments for complex logic, updated docs, type hints, docstrings\n7. **Accessibility**: For frontend code, check semantic HTML, ARIA labels, keyboard nav, contrast, alt text\n8. **Dependencies**: Review if changes introduce unnecessary dependencies or security issues\n\nProvide a thorough but concise review with:\n- Brief summary of what changed\n- Positive findings (what was done well)\n- Any issues found (categorized as Critical 🔴, Important 🟡, or Minor 🟢)\n- Actionable recommendations\n- Clear indication of whether the code is ready to merge or needs revision\n\nBe constructive, specific with examples, and context-aware (e.g., tests vs production code).",
+            "timeout": 120,
+            "statusMessage": "Reviewing code changes...",
+            "async": true,
+            "asyncRewake": true,
+            "rewakeSummary": "Code review complete"
+          }
+        ]
+      }
+    ]
+  }
+}
