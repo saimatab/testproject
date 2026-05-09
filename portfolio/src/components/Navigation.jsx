@@ -20,6 +20,15 @@ export default function Navigation() {
           >
             GitHub
           </a>
+          <a
+            href="https://www.linkedin.com/in/saimatabassum/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="nav-link"
+            title="Connect on LinkedIn"
+          >
+            LinkedIn
+          </a>
         </div>
       </div>
     </nav>

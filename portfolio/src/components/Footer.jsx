@@ -16,9 +16,10 @@ export default function Footer() {
             GitHub
           </a>
           <a
-            href="https://linkedin.com/in/saimatab"
+            href="https://www.linkedin.com/in/saimatabassum/"
             target="_blank"
             rel="noopener noreferrer"
+            title="Connect on LinkedIn"
           >
             LinkedIn
           </a>
