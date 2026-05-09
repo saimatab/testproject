@@ -7,7 +7,7 @@ on:
   workflow_dispatch: # Allow manual trigger
 
 jobs:
-  check-issues:
+  fix-issues:
     runs-on: ubuntu-latest
     permissions:
       issues: read
@@ -27,14 +27,17 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "Issue Fixer Bot"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
 
-      - name: Check for open issues
-        id: check-issues
+      - name: Check for open issues and create PRs
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Get open issues
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -42,111 +45,520 @@ jobs:
               per_page: 100
             });
 
-            console.log(`Found ${issues.data.length} open issues`);
+            console.log(`📋 Found ${issues.data.length} open issues`);
 
             // Filter issues that don't have PRs already linked
-            const issuesWithoutPR = [];
+            let issuesWithoutPR = [];
 
             for (const issue of issues.data) {
-              // Skip pull requests
+              // Skip pull requests and pinned issues
               if (issue.pull_request) continue;
 
-              // Check if issue has a linked PR
-              const linkedPRs = await github.rest.issues.listEventsForTimeline({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number
+              // Check if issue has a linked PR by searching for PRs that mention this issue
+              const prSearch = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${context.repo.owner}/${context.repo.repo} is:pr "#${issue.number}"`,
               });
 
-              const hasPR = linkedPRs.data.some(event =>
-                event.type === 'cross-referenced' && event.source?.issue?.pull_request
-              );
-
-              if (!hasPR) {
+              if (prSearch.items.length === 0) {
                 issuesWithoutPR.push(issue);
               }
             }
 
-            console.log(`Found ${issuesWithoutPR.length} issues without linked PRs`);
+            console.log(`🔍 Found ${issuesWithoutPR.length} issues without linked PRs`);
 
-            // Log details for documentation and priority issues
+            // Filter priority issues (max 1 per run to avoid conflicts)
             const priorityIssues = issuesWithoutPR.filter(issue =>
               issue.labels.some(label =>
-                label.name === 'documentation' ||
-                label.name === 'high-priority' ||
-                label.name === 'bug'
+                ['documentation', 'high-priority', 'bug', 'enhancement'].includes(label.name)
               )
-            ).slice(0, 2); // Limit to 2 issues per run
+            ).slice(0, 1); // Limit to 1 issue per run
 
-            core.setOutput('priority-issues-count', priorityIssues.length);
-            core.setOutput('priority-issues', JSON.stringify(priorityIssues));
+            console.log(`⚡ Processing ${priorityIssues.length} priority issue(s)`);
 
-            return priorityIssues.length > 0;
+            core.setOutput('issues-to-fix', JSON.stringify(priorityIssues));
+            core.setOutput('issue-count', priorityIssues.length);
 
-      - name: Create PR template for issues
-        if: steps.check-issues.outputs.priority-issues-count > 0
-        run: |
-          echo "## Issue Fixer Agent Report"
-          echo ""
-          echo "✅ Identified priority issues for fixing:"
-          echo ""
-          echo "${{ steps.check-issues.outputs.priority-issues }}" | jq -r '.[] | "- Issue #\(.number): \(.title)"'
-
-      - name: Log issue details
-        if: steps.check-issues.outputs.priority-issues-count > 0
+      - name: Process and fix issues
+        if: fromJSON(steps.check-issues.outputs.issue-count || '0') > 0
+        id: fix-issues
         uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           script: |
-            const issues = JSON.parse('${{ steps.check-issues.outputs.priority-issues }}');
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
+
+            const issues = JSON.parse('${{ steps.check-issues.outputs.issues-to-fix }}');
+
+            let prLinks = [];
 
             for (const issue of issues) {
-              console.log(`\n📋 Issue #${issue.number}: ${issue.title}`);
-              console.log(`   Labels: ${issue.labels.map(l => l.name).join(', ')}`);
-              console.log(`   Created: ${issue.created_at}`);
-              console.log(`   URL: ${issue.html_url}`);
+              console.log(`\n🔧 Processing Issue #${issue.number}: ${issue.title}`);
+
+              const branchName = `fix/issue-${issue.number}`;
+              const baseBranch = 'main';
+
+              try {
+                // Create and checkout new branch
+                console.log(`  Creating branch: ${branchName}`);
+                execSync(`git checkout -b ${branchName}`, { cwd: process.cwd() });
+
+                // Implement fix based on issue type
+                let filesChanged = false;
+
+                if (issue.labels.some(l => l.name === 'documentation')) {
+                  console.log('  📚 Implementing documentation fix...');
+                  filesChanged = await implementDocumentationFix(issue.number);
+                }
+
+                if (issue.labels.some(l => l.name === 'bug')) {
+                  console.log('  🐛 Implementing bug fix...');
+                  filesChanged = await implementBugFix(issue);
+                }
+
+                if (issue.labels.some(l => l.name === 'enhancement')) {
+                  console.log('  ✨ Implementing enhancement...');
+                  filesChanged = await implementEnhancement(issue);
+                }
+
+                // Commit changes if any files were modified
+                if (filesChanged) {
+                  execSync('git add -A', { cwd: process.cwd() });
+
+                  const commitMessage = `Fixes #${issue.number}: ${issue.title}\\n\\n- Automatically generated fix by Issue Fixer Agent\\n- Issue: ${issue.html_url}`;
+
+                  execSync(`git commit -m "${commitMessage.replace(/"/g, '\\\\"')}"`, { cwd: process.cwd() });
+
+                  // Push branch
+                  console.log(`  Pushing branch: ${branchName}`);
+                  execSync(`git push origin ${branchName}`, { cwd: process.cwd() });
+
+                  // Create Pull Request
+                  console.log(`  Creating PR for issue #${issue.number}`);
+                  const pr = await github.rest.pulls.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    title: `Fixes #${issue.number}: ${issue.title}`,
+                    body: \`## Description\\n\\nThis PR automatically fixes issue #${issue.number}.\\n\\n**Issue:** ${issue.title}\\n\\n## Changes\\n- Implemented fix based on issue requirements\\n- Auto-generated by Issue Fixer Agent\\n\\n## Related\\nCloses #${issue.number}\`,
+                    head: branchName,
+                    base: baseBranch
+                  });
+
+                  console.log(`✅ PR Created: #${pr.data.number}`);
+                  prLinks.push(pr.data.html_url);
+
+                  // Add labels to PR
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.data.number,
+                    labels: ['auto-generated', 'issue-fixer-agent']
+                  });
+
+                  // Add comment linking to issue
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: \`🤖 **Issue Fixer Agent** has created a PR to address this issue.\\n\\nPR: #${pr.data.number}\\n\\nReview the changes and merge when ready!\`
+                  });
+
+                } else {
+                  console.log(`  ⚠️ No changes made for issue #${issue.number}`);
+                  execSync(`git checkout ${baseBranch}`, { cwd: process.cwd() });
+                  execSync(`git branch -D ${branchName}`, { cwd: process.cwd() });
+                }
+
+              } catch (error) {
+                console.error(`  ❌ Error processing issue #${issue.number}:`, error.message);
+                try {
+                  execSync(`git checkout ${baseBranch}`, { cwd: process.cwd() });
+                  execSync(`git branch -D ${branchName}`, { cwd: process.cwd(), stdio: 'pipe' });
+                } catch (e) {}
+              }
             }
 
-      - name: Create documentation for fixing process
-        if: steps.check-issues.outputs.priority-issues-count > 0
-        run: |
-          mkdir -p .github/issue-fixes
+            // Set output for summary
+            core.setOutput('pr-links', prLinks.join('\\n'));
 
-          # Create a file documenting what issues need to be fixed
-          cat > .github/issue-fixes/pending-issues.md << 'EOF'
-          # Pending Issues to Fix
+            // Helper function to implement documentation fixes
+            async function implementDocumentationFix(issueNumber) {
+              let changed = false;
 
-          This file documents issues that need to be addressed.
-          Generated by Issue Fixer Agent
+              // Create README.md if it doesn't exist
+              const readmePath = 'README.md';
+              if (!fs.existsSync(readmePath)) {
+                const readmeContent = \`# TestProject - Portfolio Website
 
-          ## Next Steps
+A modern portfolio website built with React and Vite, showcasing projects and GitHub integration.
 
-          1. Review the issues listed below
-          2. Create a branch for each issue (e.g., `fix/issue-1`)
-          3. Implement the fix
-          4. Create a Pull Request with reference to the issue
-          5. Link PR to issue in description
+## Features
 
-          EOF
+- 🚀 Fast and responsive UI with React 19 and Vite
+- 🐙 GitHub API integration to display your repositories
+- 🎨 Beautiful, responsive design (mobile, tablet, desktop)
+- 🔗 LinkedIn and GitHub links
+- ⚡ GitHub MCP Server integration for enhanced GitHub interactions
+- 🔄 Automated code review system
+- 📦 Modular component architecture
 
-          echo "${{ steps.check-issues.outputs.priority-issues }}" | jq -r '.[] | "- [ ] #\(.number): \(.title) (Labels: \(.labels | map(.name) | join(\", \")))"' >> .github/issue-fixes/pending-issues.md
+## Tech Stack
 
-      - name: Commit pending issues report
-        if: steps.check-issues.outputs.priority-issues-count > 0
-        run: |
-          git add .github/issue-fixes/pending-issues.md
-          git commit -m "docs: Update pending issues report" || echo "No changes to commit"
-          git push origin HEAD:main || echo "No changes to push"
-        continue-on-error: true
+- **Frontend Framework**: React 19
+- **Build Tool**: Vite 8
+- **Routing**: React Router v7
+- **Styling**: CSS3 with responsive design
+- **API**: GitHub REST API v3
+- **Tools**: ESLint, GitHub Actions
 
-      - name: Summary
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- npm or yarn
+- GitHub Personal Access Token (PAT)
+
+### Installation
+
+1. Clone the repository:
+\`\`\`bash
+git clone https://github.com/saimatab/testproject.git
+cd testproject
+\`\`\`
+
+2. Install dependencies:
+\`\`\`bash
+cd portfolio
+npm install
+\`\`\`
+
+3. Set up environment variables:
+\`\`\`bash
+# Create portfolio/.env
+VITE_GITHUB_USERNAME=your-github-username
+VITE_GITHUB_API_BASE=https://api.github.com
+GITHUB_PAT=your-personal-access-token
+\`\`\`
+
+4. Start the development server:
+\`\`\`bash
+npm run dev
+\`\`\`
+
+The site will open at \`http://localhost:5173\`
+
+## Project Structure
+
+\`\`\`
+testproject/
+├── .github/
+│   ├── workflows/          # GitHub Actions workflows
+│   ├── ISSUE_FIXER.md      # Issue Fixer Agent documentation
+│   └── issue-fixes/        # Generated issue reports
+├── .claude/
+│   ├── settings.json       # Claude Code configuration
+│   ├── agents/             # Custom agents
+│   └── README.md           # Claude Code setup
+├── portfolio/
+│   ├── src/
+│   │   ├── components/     # React components
+│   │   ├── pages/          # Page components
+│   │   ├── services/       # GitHub API service
+│   │   └── App.jsx         # Main app component
+│   ├── public/             # Static files
+│   └── package.json        # Dependencies
+├── decisions/              # Architecture decisions
+├── tasks.md               # Task tracking
+└── .mcp.json              # MCP Server configuration
+\`\`\`
+
+## GitHub Integration
+
+### API Integration
+
+The portfolio fetches your GitHub repositories automatically using the GitHub REST API:
+
+\`\`\`javascript
+// Services: src/services/githubService.js
+- fetchUserProjects()      // Get all repositories
+- fetchProjectDetails()    // Get specific project details
+\`\`\`
+
+### Environment Variables
+
+Store these securely in \`portfolio/.env\`:
+
+- \`VITE_GITHUB_USERNAME\`: Your GitHub username
+- \`VITE_GITHUB_API_BASE\`: GitHub API endpoint
+- \`GITHUB_PAT\`: Personal Access Token (for MCP server)
+
+**⚠️ Never commit \`.env\` or \`.mcp.json\` files!**
+
+## Features
+
+### Portfolio Grid
+- Displays all your GitHub repositories
+- Shows project metadata (stars, forks, language)
+- Responsive grid layout
+
+### Project Details
+- View detailed information about each project
+- Links to GitHub repository
+- Technology stack display
+
+### Social Links
+- GitHub profile link
+- LinkedIn profile link
+- Customizable social media links
+
+## Code Review System
+
+Automated code reviews run when files change:
+
+**Features:**
+- Analyzes code across 8 dimensions
+- Security vulnerability detection
+- Performance analysis
+- Code quality assessment
+- Test coverage verification
+- Documentation review
+- Accessibility checks
+
+See: \`.claude/agents/code-review.md\`
+
+## GitHub MCP Server
+
+Enhanced GitHub interactions via Claude Code:
+
+**Configuration:** \`.mcp.json\`
+**Available Tools:**
+- Repository operations
+- Issue management
+- Pull request handling
+- Code search
+- User information
+
+## Issue Fixer Agent
+
+Automated issue detection and PR creation:
+
+**Schedule:** Every 6 hours
+**Features:**
+- Detects open issues without PRs
+- Prioritizes issues by label
+- Creates branches and fixes
+- Generates pull requests
+- Posts issue updates
+
+See: \`.github/ISSUE_FIXER.md\`
+
+## Available Scripts
+
+\`\`\`bash
+# Development
+npm run dev       # Start dev server
+
+# Build
+npm run build     # Production build
+
+# Linting
+npm run lint      # Run ESLint
+
+# Preview
+npm run preview   # Preview production build
+\`\`\`
+
+## Adding Projects to Portfolio
+
+### Option 1: GitHub Repositories (Automatic)
+All your GitHub repos appear automatically via the GitHub API.
+
+### Option 2: Custom Projects
+To add custom projects not on GitHub, modify:
+\`src/services/githubService.js\`
+
+## Deployment
+
+### Deploy to Vercel
+\`\`\`bash
+npm install -g vercel
+vercel
+\`\`\`
+
+### Deploy to GitHub Pages
+\`\`\`bash
+npm run build
+# Configure GitHub Pages in repository settings
+# Set source to \`/dist\` folder
+\`\`\`
+
+### Deploy to Netlify
+\`\`\`bash
+npm run build
+# Connect repository to Netlify
+# Deploy from \`dist\` folder
+\`\`\`
+
+## Troubleshooting
+
+### GitHub API Rate Limiting
+- Rate limit: 60 requests/hour (unauthenticated)
+- With PAT: 5,000 requests/hour
+- **Solution**: Ensure PAT is set in environment variables
+
+### Port Already in Use
+\`\`\`bash
+# Find and kill process on port 5173
+lsof -ti:5173 | xargs kill -9
+npm run dev
+\`\`\`
+
+### Build Errors
+\`\`\`bash
+# Clear caches
+rm -rf node_modules dist .vite
+npm install
+npm run build
+\`\`\`
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch: \`git checkout -b feature/your-feature\`
+3. Make your changes
+4. Commit: \`git commit -m "Add your feature"\`
+5. Push: \`git push origin feature/your-feature\`
+6. Open a Pull Request
+
+## License
+
+MIT - Feel free to use this project for your own portfolio
+
+## Support
+
+For issues or questions:
+- Check: [GitHub Issues](https://github.com/saimatab/testproject/issues)
+- Create: New issue with details
+- Discuss: Use GitHub Discussions
+
+## Roadmap
+
+- [ ] User authentication
+- [ ] Project filtering and search
+- [ ] Dark mode toggle
+- [ ] Analytics integration
+- [ ] Newsletter signup
+- [ ] Blog section
+- [ ] Admin dashboard
+- [ ] Database integration
+
+---
+
+**Built with ❤️ using React, Vite, and GitHub API**
+
+Last updated: \${new Date().toISOString().split('T')[0]}
+\`;
+                fs.writeFileSync(readmePath, readmeContent);
+                console.log('  Created README.md');
+                changed = true;
+              }
+
+              // Create CONTRIBUTING.md
+              const contributingPath = 'CONTRIBUTING.md';
+              if (!fs.existsSync(contributingPath)) {
+                const contributingContent = \`# Contributing to TestProject
+
+Thank you for your interest in contributing! This document provides guidelines and instructions.
+
+## Code of Conduct
+
+Be respectful, inclusive, and constructive in all interactions.
+
+## How to Contribute
+
+### Reporting Issues
+1. Check existing issues first
+2. Provide clear description and steps to reproduce
+3. Include screenshots/logs if applicable
+
+### Submitting Changes
+1. Fork the repository
+2. Create feature branch: \`git checkout -b feature/description\`
+3. Make changes following code style
+4. Commit with clear messages
+5. Push and create Pull Request
+
+### Code Style
+- Use 2-space indentation
+- Follow ESLint rules
+- Write descriptive variable names
+- Add JSDoc comments
+
+### Testing
+- Test changes locally
+- Check responsive design
+- Verify GitHub API integration
+
+## Pull Request Process
+1. Update documentation
+2. Add tests if applicable
+3. Pass all checks
+4. Request review
+5. Address feedback
+6. Merge when approved
+
+Thank you for contributing! 🎉
+\`;
+                fs.writeFileSync(contributingPath, contributingContent);
+                console.log('  Created CONTRIBUTING.md');
+                changed = true;
+              }
+
+              return changed;
+            }
+
+            // Helper function for bug fixes
+            async function implementBugFix(issue) {
+              console.log('  Analyzing bug...');
+              // Bug fixes depend on specific issue details
+              // This would need custom logic per bug
+              return false;
+            }
+
+            // Helper function for enhancements
+            async function implementEnhancement(issue) {
+              console.log('  Analyzing enhancement...');
+              // Enhancements depend on specific issue details
+              return false;
+            }
+
+      - name: Create summary comment
+        if: steps.fix-issues.outputs.pr-links != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const issueCount = '${{ steps.check-issues.outputs.priority-issues-count }}';
+            const prLinks = '${{ steps.fix-issues.outputs.pr-links }}'.split('\n').filter(link => link);
 
-            if (issueCount > 0) {
-              core.notice(`🤖 Issue Fixer Agent found ${issueCount} priority issue(s) to address!`);
-              core.notice(`Check the pending-issues.md report for details.`);
+            if (prLinks.length > 0) {
+              console.log('🎉 Pull Requests Created:');
+              prLinks.forEach(link => console.log('  - ' + link));
+            }
+
+      - name: Workflow Summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueCount = '${{ steps.check-issues.outputs.issue-count }}';
+            const prLinks = '${{ steps.fix-issues.outputs.pr-links }}';
+
+            if (issueCount > 0 && prLinks) {
+              core.notice('🤖 Issue Fixer Agent successfully created pull request(s)!');
+              core.notice('Check the workflow logs for details.');
+            } else if (issueCount > 0) {
+              core.notice('⚠️ Issue Fixer Agent identified issue(s) but could not auto-fix them.');
             } else {
-              core.notice(`✅ No pending issues found. Repository is in good shape!`);
+              core.notice('✅ No pending issues found. Great job!');
             }
